@@ -1,0 +1,75 @@
+name: Main push guard (reusable)
+
+# Org opinest je na GitHub Free, takže súkromné repá nemajú ruleset na main.
+# Tento workflow nič neblokuje, len upozorní: keď na main/master príde commit,
+# ktorý nevznikol z PR, založí issue (a pošle Slack, ak repo má SLACK_WEBHOOK_URL).
+#
+# Volanie z repa (.github/workflows/main-push-guard.yml):
+#   on:
+#     push:
+#       branches: [main, master]
+#   permissions:
+#     contents: read
+#     issues: write
+#     pull-requests: read
+#   jobs:
+#     guard:
+#       uses: opinest/opinest-ci-templates/.github/workflows/main-push-guard.yml@<sha> # v1
+#       secrets: inherit
+
+on:
+  workflow_call:
+    inputs:
+      assignee:
+        type: string
+        default: "matejkaraba"
+        description: "GitHub login, ktorému sa priradí upozornenie"
+    secrets:
+      SLACK_WEBHOOK_URL:
+        required: false
+
+permissions:
+  contents: read
+  issues: write
+  pull-requests: read
+
+jobs:
+  guard:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    # Release a Dependabot commity idú cez PR; boti priamo na main nepushujú.
+    if: ${{ !endsWith(github.actor, '[bot]') }}
+    steps:
+      - name: Check that the pushed commit came from a PR
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+          ACTOR: ${{ github.actor }}
+          REF: ${{ github.ref_name }}
+          COMPARE: ${{ github.event.compare }}
+          ASSIGNEE: ${{ inputs.assignee }}
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+        run: |
+          set -euo pipefail
+          # GitHub prepojí merge commit s PR o pár sekúnd neskôr.
+          for i in 1 2 3; do
+            prs="$(gh api "repos/$REPO/commits/$SHA/pulls" --jq 'map(select(.merged_at != null)) | length')"
+            [ "$prs" -gt 0 ] && { echo "OK: $SHA patrí k zlúčenému PR."; exit 0; }
+            sleep 15
+          done
+
+          title="Priamy push na $REF mimo PR (${SHA:0:7}, $ACTOR)"
+          body="$ACTOR pushol na \`$REF\` commit ${SHA:0:7}, ktorý nevznikol z PR.
+
+          Zmeny: $COMPARE
+
+          Ak to bol zámer (napr. hotfix), stačí issue zavrieť s krátkym vysvetlením."
+          gh issue create --repo "$REPO" --title "$title" --body "$body" --assignee "$ASSIGNEE" \
+            || gh issue create --repo "$REPO" --title "$title" --body "$body"
+
+          if [ -n "${SLACK_WEBHOOK_URL:-}" ]; then
+            payload="$(jq -n --arg t ":warning: $REPO: $title. $COMPARE" '{text: $t}')"
+            curl -fsS -m 10 -X POST -H 'Content-Type: application/json' -d "$payload" "$SLACK_WEBHOOK_URL" >/dev/null || true
+          fi
+          echo "::warning::$title"
